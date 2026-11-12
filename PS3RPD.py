@@ -53,6 +53,9 @@ def clean_text(value):
         value = value.get_text()
     text = unescape(str(value))
     text = text.replace("\xa0", " ")  # &nbsp;
+    # Strip trademark / registered / copyright symbols - they clutter Discord
+    # and hurt SteamGridDB search accuracy.
+    text = re.sub(r"[\u2122\u00ae\u00a9]", "", text)  # ™ ® ©
     return re.sub(r"\s+", " ", text).strip()
 
 
