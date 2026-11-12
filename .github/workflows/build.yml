@@ -13,7 +13,7 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: macos-13
+          - os: macos-latest
             artifact: PS3-Rich-Presence-macOS
           - os: windows-latest
             artifact: PS3-Rich-Presence-Windows
