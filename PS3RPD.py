@@ -19,6 +19,7 @@ from time import (
 import subprocess  # used to send ICMP ping packets to PS3
 import platform  # used to get operating system of PC
 import sqlite3  # used for getting image from database
+import threading  # used for stop-signal-aware polling
 import networkscan  # used for automatic obtaining IP address
 from time import time
 from urllib.parse import quote as url_quote
@@ -99,7 +100,7 @@ SGDB_BASE = "https://www.steamgriddb.com/api/v2"
 _sgdb_cache: dict[str, str | None] = {}
 
 
-def sgdb_get_grid(game_name: str, api_key: str) -> str | None:
+def sgdb_get_grid(game_name: str, api_key: str, log=print) -> str | None:
     """Search SteamGridDB for *game_name* and return the first grid image URL, or None.
 
     Results are cached in-memory for the lifetime of the process.
@@ -114,14 +115,14 @@ def sgdb_get_grid(game_name: str, api_key: str) -> str | None:
         search_url = f"{SGDB_BASE}/search/autocomplete/{url_quote(game_name)}"
         resp = requests.get(search_url, headers=headers, timeout=10)
         if resp.status_code != 200:
-            print(f"sgdb_get_grid(): search returned {resp.status_code}")
+            log(f"sgdb_get_grid(): search returned {resp.status_code}")
             _sgdb_cache[game_name] = None
             return None
 
         data = resp.json()
         games = data.get("data", [])
         if not games:
-            print(f"sgdb_get_grid(): no results for '{game_name}'")
+            log(f"sgdb_get_grid(): no results for '{game_name}'")
             _sgdb_cache[game_name] = None
             return None
 
@@ -134,24 +135,24 @@ def sgdb_get_grid(game_name: str, api_key: str) -> str | None:
         grids_url = f"{SGDB_BASE}/grids/game/{game_id}"
         resp = requests.get(grids_url, headers=headers, timeout=10)
         if resp.status_code != 200:
-            print(f"sgdb_get_grid(): grids returned {resp.status_code}")
+            log(f"sgdb_get_grid(): grids returned {resp.status_code}")
             _sgdb_cache[game_name] = None
             return None
 
         grids = resp.json().get("data", [])
         if not grids:
-            print(f"sgdb_get_grid(): no grids for game_id={game_id}")
+            log(f"sgdb_get_grid(): no grids for game_id={game_id}")
             _sgdb_cache[game_name] = None
             return None
 
         url = grids[0].get("url") or grids[0].get("thumb")
         _sgdb_cache[game_name] = url
         if url:
-            print(f"sgdb_get_grid(): found grid for '{game_name}'")
+            log(f"sgdb_get_grid(): found grid for '{game_name}'")
         return url
 
     except Exception as e:
-        print(f"sgdb_get_grid(): error - {e}")
+        log(f"sgdb_get_grid(): error - {e}")
         _sgdb_cache[game_name] = None
         return None
 
@@ -168,31 +169,31 @@ GAMETDB_REGION_MAP = {
 }
 
 
-def gametdb_get_cover(title_id: str) -> str | None:
+def gametdb_get_cover(title_id: str, log=print) -> str | None:
     """Return a GameTDB cover URL for *title_id*, or None on failure."""
     if not title_id or len(title_id) < 3:
         return None
     region = GAMETDB_REGION_MAP.get(title_id[2])
     if not region:
-        print(f"gametdb_get_cover(): unexpected region char '{title_id[2]}'")
+        log(f"gametdb_get_cover(): unexpected region char '{title_id[2]}'")
         return None
     url = f"https://art.gametdb.com/ps3/cover/{region}/{title_id}.jpg"
     try:
         resp = requests.get(url, headers={"User-Agent": "PS3RPD/2.0"}, timeout=10)
         if resp.status_code == 200:
-            print("gametdb_get_cover(): found")
+            log("gametdb_get_cover(): found")
             return url
         else:
-            print(f"gametdb_get_cover(): {resp.status_code} for {url}")
+            log(f"gametdb_get_cover(): {resp.status_code} for {url}")
             return None
     except Exception as e:
-        print(f"gametdb_get_cover(): error - {e}")
+        log(f"gametdb_get_cover(): error - {e}")
         return None
 
 
 # --- Unified art resolver --------------------------------------------------------
 
-def resolve_art(game_name: str, title_id: str | None, config: dict) -> str:
+def resolve_art(game_name: str, title_id: str | None, config: dict, log=print) -> str:
     """Try every art source in order; always return *something* (never raise).
 
     Priority:
@@ -205,7 +206,7 @@ def resolve_art(game_name: str, title_id: str | None, config: dict) -> str:
     # SteamGridDB
     api_key = config.get("steamgriddb_api_key", "")
     if api_key and game_name:
-        url = sgdb_get_grid(game_name, api_key)
+        url = sgdb_get_grid(game_name, api_key, log=log)
         if url:
             return url
 
@@ -220,14 +221,14 @@ def resolve_art(game_name: str, title_id: str | None, config: dict) -> str:
             con.close()
             if result:
                 img = re.sub(r"[ \n]", "", result[0][2])
-                print("resolve_art(): using psimg.db")
+                log("resolve_art(): using psimg.db")
                 return img
         except Exception as e:
-            print(f"resolve_art(): psimg.db error - {e}")
+            log(f"resolve_art(): psimg.db error - {e}")
 
     # GameTDB
     if title_id:
-        url = gametdb_get_cover(title_id)
+        url = gametdb_get_cover(title_id, log=log)
         if url:
             return url
 
@@ -254,6 +255,330 @@ default_config = {
     "use_appname": False,
     "steamgriddb_api_key": "",
 }
+
+HTTP_HEADERS = {"User-Agent": "Mozilla/5.0"}
+WMAN_VER = "1.47.48"
+
+
+class PS3RPDEngine:
+    """Core engine for PS3 Rich Presence.  Thread-safe, callback-driven."""
+
+    config_path = Path("ps3rpdconfig.txt")
+
+    def __init__(self, log_callback=None, status_callback=None):
+        self._log = log_callback or print
+        self._status_cb = status_callback or (lambda s: None)
+        self._stop = threading.Event()
+        self.RPC = None
+        self.config = dict(default_config)
+        self._timer = None
+        self._prev_title = ""
+        self._discord_connected = False
+        self._ps3_connected = False
+        # Current game state
+        self._game_name = None
+        self._title_id = None
+        self._thermals = None
+        self._image_url = None
+        self._game_kind = None
+        self._is_retro = False
+
+    # --- config ---
+
+    def load_config(self):
+        """Load config from disk, merging defaults for missing keys."""
+        if self.config_path.is_file():
+            with self.config_path.open(mode="r") as f:
+                self.config = json.load(f)
+            for key, val in default_config.items():
+                if key not in self.config:
+                    self.config[key] = val
+        else:
+            self.config = dict(default_config)
+        self.config["wait_seconds"] = max(15, self.config.get("wait_seconds", 35))
+
+    def save_config(self):
+        """Persist current config to disk."""
+        with self.config_path.open(mode="w+") as f:
+            json.dump(self.config, f, indent=4)
+
+    # --- network helpers ---
+
+    @staticmethod
+    def test_for_webman(ip):
+        """Return True if *ip* is running webmanMOD."""
+        try:
+            response = requests.get(
+                f"http://{ip}", headers=HTTP_HEADERS, timeout=10
+            )
+        except (ConnectionError, requests.exceptions.Timeout):
+            return False
+        if response is not None:
+            soup = BeautifulSoup(response.text, "html.parser")
+            page_title = str(soup.find("title"))
+            return "wMAN" in page_title or "webMAN" in page_title
+        return False
+
+    def ping_ps3(self):
+        """ICMP-ping the configured PS3 IP.  Returns True on success."""
+        ip = self.config.get("ip", "")
+        if not ip:
+            return False
+        if platform.system().lower() == "windows":
+            command = ["ping", "-n", "5", ip]
+        else:
+            command = ["ping", "-c", "5", ip]
+        with open(os.devnull, "w") as devnull:
+            try:
+                subprocess.check_call(command, stdout=devnull, stderr=devnull)
+                return True
+            except subprocess.CalledProcessError:
+                return False
+
+    def grab_host_network(self):
+        """Detect the local network prefix (e.g. '192.168.1.')."""
+        try:
+            s = socket(AF_INET, SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            host = s.getsockname()[0]
+            s.close()
+            return re.search(r"^(.*)\\.", host).group(0)
+        except Exception:
+            return None
+
+    def scan_network(self, network_prefix):
+        """Scan the local /24 for a PS3 running webmanMOD.  Returns IP or None."""
+        target = network_prefix + "0/24"
+        try:
+            scan = networkscan.Networkscan(target)
+            scan.run()
+            for host in scan.list_of_hosts_found:
+                if self.test_for_webman(host):
+                    return host
+        except Exception as e:
+            self._log(f"scan_network(): {e}")
+        return None
+
+    # --- HTML scraping ---
+
+    def _get_html(self):
+        """Fetch the cpursx page from webman.  Returns BeautifulSoup or None."""
+        ip = self.config.get("ip", "")
+        if not ip:
+            return None
+        if not self.ping_ps3():
+            return None
+        url = f"http://{ip}/cpursx.ps3?/sman.ps3"
+        try:
+            response = requests.get(url, headers=HTTP_HEADERS, timeout=10)
+            response.encoding = "utf-8"
+            return BeautifulSoup(response.text, "html.parser")
+        except (ConnectionError, requests.exceptions.Timeout) as e:
+            self._log(f"get_html(): webman not found. \"{e}\".")
+            return None
+
+    def _get_thermals(self, soup):
+        """Extract CPU/RSX temps from parsed page."""
+        el = soup.find("a", href="/cpursx.ps3?up")
+        raw = str(el)
+        cpu = re.search(r"CPU(.+?)C", raw)
+        rsx = re.search(r"RSX(.+?)C", raw)
+        try:
+            self._thermals = f"{cpu.group(0)} | {rsx.group(0)}"
+            self._log(f"get_thermals(): {self._thermals}")
+        except AttributeError:
+            self._log(
+                f"get_thermals(): could not find thermal data, has webmanMOD been updated since {WMAN_VER}?"
+            )
+            self._thermals = None
+
+    def _decide_game(self, soup):
+        """Parse game info from the webman page and resolve art."""
+        self._is_retro = False
+        self._title_id, self._game_name, self._game_kind = parse_game_info(soup)
+
+        if self._game_kind == "ps3":
+            self._log(f"decide_game(): PS3 Game or Homebrew")
+            self._log(f"get_PS3_details(): {self._title_id} | {self._game_name}")
+            if self._prev_title != self._title_id:
+                self._image_url = resolve_art(
+                    self._game_name, self._title_id, self.config, log=self._log
+                )
+                self._log(f"get_PS3_details(): image = {self._image_url}")
+        elif self._game_kind == "retro":
+            self._is_retro = True
+            self._log(f"decide_game(): Retro")
+            self._log(f"get_retro_details(): {self._game_name}")
+            self._image_url = resolve_art(
+                self._game_name, None, self.config, log=self._log
+            )
+            self._log(f"get_retro_details(): image = {self._image_url}")
+        else:
+            self._log("decide_game(): XMB")
+            self._image_url = "xmb"
+            self._title_id = None
+
+    # --- Discord RPC ---
+
+    def connect_discord(self):
+        """Connect to the local Discord client via RPC.  Returns True on success."""
+        try:
+            self.RPC = Presence(self.config["client_id"])
+            self.RPC.connect()
+            self._discord_connected = True
+            self._log("connected to Discord client")
+            self._push_status()
+            return True
+        except DiscordNotFound as e:
+            self._log(f"could not find Discord client running. \"{e}\"")
+            self._discord_connected = False
+            self._push_status()
+            return False
+        except (InvalidPipe, InvalidID) as e:
+            self._log(f"Discord connection failed. \"{e}\"")
+            self._discord_connected = False
+            self._push_status()
+            return False
+        except Exception as e:
+            self._log(f"Discord connection error: {e}")
+            self._discord_connected = False
+            self._push_status()
+            return False
+
+    def disconnect_discord(self):
+        """Cleanly close the Discord RPC connection."""
+        if self.RPC is not None:
+            try:
+                self.RPC.clear()
+            except Exception:
+                pass
+            try:
+                self.RPC.close()
+            except Exception:
+                pass
+        self.RPC = None
+        self._discord_connected = False
+        self._push_status()
+
+    def _update_rpc(self):
+        """Push current state to Discord.  On pipe failure, mark disconnected."""
+        if not self._discord_connected or self.RPC is None:
+            return
+        try:
+            if self.config.get("use_appname"):
+                self.RPC.update(
+                    details=self._game_name,
+                    state=self._thermals,
+                    large_image=self._image_url,
+                    large_text=self._title_id,
+                    start=self._timer,
+                )
+            else:
+                self.RPC.update(
+                    name=self._game_name,
+                    details=self._thermals,
+                    large_image=self._image_url,
+                    large_text=self._title_id,
+                    start=self._timer,
+                )
+        except (InvalidPipe, InvalidID):
+            self._log("Discord disconnected.")
+            self._discord_connected = False
+            try:
+                self.RPC.close()
+            except Exception:
+                pass
+            self.RPC = None
+            self._push_status()
+
+    # --- status dict ---
+
+    def _make_status(self):
+        elapsed = None
+        if self._timer is not None:
+            elapsed = time() - self._timer
+        return {
+            "connected_discord": self._discord_connected,
+            "connected_ps3": self._ps3_connected,
+            "game_name": self._game_name,
+            "title_id": self._title_id,
+            "thermals": self._thermals,
+            "image_url": self._image_url,
+            "game_kind": self._game_kind,
+            "elapsed_seconds": elapsed,
+        }
+
+    def _push_status(self):
+        self._status_cb(self._make_status())
+
+    # --- main polling loop ---
+
+    def run(self):
+        """Blocking polling loop.  Honors self._stop threading.Event."""
+        self._timer = time() if self.config.get("show_timer") else None
+        self._prev_title = ""
+        closed = False
+
+        if not self.config.get("ip"):
+            self._log("No PS3 IP configured.")
+            return
+
+        while not self._stop.is_set():
+            soup = self._get_html()
+            if soup is None:
+                self._ps3_connected = False
+                if self._is_retro:
+                    self._log(
+                        f"PS2 game previously mounted, keeping RPC active and waiting {self.config['wait_seconds']} seconds"
+                    )
+                    self._push_status()
+                    self._stop.wait(self.config["wait_seconds"])
+                else:
+                    self._log(
+                        f"PS3 not found on network, closing RPC and hibernating {self.config['hibernate_seconds']} seconds."
+                    )
+                    if not closed and self._discord_connected:
+                        try:
+                            self.RPC.clear()
+                        except Exception:
+                            pass
+                        try:
+                            self.RPC.close()
+                        except Exception:
+                            pass
+                        self._discord_connected = False
+                    closed = True
+                    self._push_status()
+                    self._stop.wait(float(self.config["hibernate_seconds"]))
+            else:
+                self._ps3_connected = True
+                self._log("")
+                if closed:
+                    self.connect_discord()
+                    self._timer = time()
+                    closed = False
+                if self.config.get("show_temp"):
+                    self._get_thermals(soup)
+                self._decide_game(soup)
+                self._update_rpc()
+                self._prev_title = self._title_id
+                self._push_status()
+                self._stop.wait(self.config["wait_seconds"])
+
+    def stop(self):
+        """Signal the polling loop to exit."""
+        self._stop.set()
+
+    @property
+    def stopped(self):
+        return self._stop.is_set()
+
+
+# ---------------------------------------------------------------------------------
+# Legacy globals & helpers preserved for backwards compat with `if __name__`
+
+http_headers = HTTP_HEADERS
+wmanVer = WMAN_VER
 
 
 class PrepWork:
@@ -305,7 +630,7 @@ class PrepWork:
             print(f'Error while getting host network. "{e}"')
 
         if hostNetwork is not None:
-            hostNetwork = re.search(r"^(.*)\.", hostNetwork).group(0)
+            hostNetwork = re.search(r"^(.*)\\.", hostNetwork).group(0)
             print(f'expected network is "{hostNetwork}"')
             self.scan_network(hostNetwork)
 
@@ -452,10 +777,6 @@ class GatherDetails:
         # Try SteamGridDB for retro titles too
         self.image = resolve_art(self.name, None, prepWork.config)
         print(f"get_retro_details(): image = {self.image}")
-
-
-http_headers = {"User-Agent": "Mozilla/5.0"}
-wmanVer = "1.47.48"
 
 
 def main():
