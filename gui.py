@@ -75,8 +75,8 @@ class App(tk.Tk):
         super().__init__()
         self.title("PS3 Rich Presence for Discord")
         self.configure(bg=BG)
-        self.minsize(960, 620)
-        self.geometry("1060x680")
+        self.minsize(1060, 660)
+        self.geometry("1120x720")
 
         # Try to set the window icon
         icon_path = os.path.join(_HERE, "img", "ps32025.png")
@@ -115,7 +115,9 @@ class App(tk.Tk):
     # ---- UI construction ----------------------------------------------------
 
     def _build_ui(self):
-        self.columnconfigure(1, weight=1)
+        self.columnconfigure(0, weight=0, minsize=260)
+        self.columnconfigure(1, weight=3, minsize=420)
+        self.columnconfigure(2, weight=0, minsize=280)
         self.rowconfigure(0, weight=1)
 
         self._build_left_panel()
@@ -203,8 +205,8 @@ class App(tk.Tk):
                        bg=BG, fg=TEXT_HEADER, anchor="w")
         lbl.pack(fill="x", pady=(0, 8))
 
-        # Profile card (large)
-        self._profile_canvas = tk.Canvas(frame, bg=BG, highlightthickness=0)
+        # Profile card (large) - needs enough height for art + text
+        self._profile_canvas = tk.Canvas(frame, bg=BG, highlightthickness=0, height=260)
         self._profile_canvas.pack(fill="both", expand=True, pady=(0, 8))
         self._profile_canvas.bind("<Configure>", lambda e: self._draw_profile_card())
 
